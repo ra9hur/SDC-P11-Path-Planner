@@ -9,6 +9,9 @@
 #include "Eigen-3.3/Eigen/QR"
 #include "json.hpp"
 
+#include "spline.h"
+#include "PathPlanner.h"
+
 using namespace std;
 
 // for convenience
@@ -159,6 +162,29 @@ vector<double> getXY(double s, double d, vector<double> maps_s, vector<double> m
 
 }
 
+void sort_coords(vector<double> &v1, vector<double> &v2) {
+	vector<vector<vector<double>>> vv;
+	int vsize = v1.size();
+	for(int i = 0; i < vsize; ++i) {
+		//vector<vector<double>> vt[i] = {v1[i], v2[i]};
+		vector<vector<double>> vt;
+		vt.push_back({v1[i], v2[i]});
+		vv.push_back(vt);
+	}
+	sort(vv.begin(), vv.end());
+
+	v1.clear();
+	v2.clear();
+	for(int i = 0; i < vsize; ++i) {
+		if(i > 0 && vv[i][0] == vv[i-1][0]) {
+			continue;
+		}
+		v1.push_back(vv[i][0][0]);
+		v2.push_back(vv[i][0][1]);
+	}
+}
+
+
 int main() {
   uWS::Hub h;
 
@@ -196,7 +222,14 @@ int main() {
   	map_waypoints_dy.push_back(d_y);
   }
 
-  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
+
+  int lane = 1;
+
+  // Reference velocity to target
+  double ref_vel = 0.;					// mph
+
+
+  h.onMessage([&lane,&ref_vel,&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                      uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
     // The 4 signifies a websocket message
@@ -238,9 +271,183 @@ int main() {
           	vector<double> next_x_vals;
           	vector<double> next_y_vals;
 
+          	int path_size = previous_path_x.size();
+			vector<double> ptsx;
+			vector<double> ptsy;
 
-          	// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
-          	msgJson["next_x"] = next_x_vals;
+
+			if (path_size > 0) {
+				// Position of the car after (0.02 * 50) seconds
+				car_s = end_path_s;
+			}
+
+
+			cout << "************************" << endl;
+			PathPlanner pp = PathPlanner();
+
+			// lane width is 4 meters
+			char current_lane = pp.GetCurrentLane(car_d);
+			cout << "Current Lane: " << current_lane << endl;
+
+			// Collect data within 50m distance around ego car
+			pp.MaintainListSurroundingCars(sensor_fusion, car_s);
+
+			// Check speed change is required
+			bool too_close = pp.CheckChangeSpeed(car_s, path_size);
+			cout << "Check Change Lane: " << too_close << endl;
+
+			// To check if surrounding cars are moving into the lane that ego car is currently on
+			bool OtherCarLC = pp.CheckOtherCarLC(car_speed);
+
+            double ref_x = car_x;
+            double ref_y = car_y;
+            double ref_yaw = deg2rad(car_yaw);
+
+			// Use two points that make the path tangent to the car
+          	// This is when the car is just starting and does not have previous points for reference
+			if(path_size < 2) {
+				pp.lane = 1;
+
+				double prev_car_x = car_x - cos(car_yaw);
+				double prev_car_y = car_y - sin(car_yaw);
+
+				ptsx.push_back(prev_car_x);
+				ptsx.push_back(car_x);
+
+				ptsy.push_back(prev_car_y);
+				ptsy.push_back(car_y);
+			}
+			// Use previous path's end point as starting reference
+			else {
+				// Redefine reference state as previous path end point
+				ref_x = previous_path_x[path_size-1];
+              	ref_y = previous_path_y[path_size-1];
+
+				// Use two points that make the path tangent to the previous path's end points
+              	double ref_x_prev = previous_path_x[path_size-2];
+              	double ref_y_prev = previous_path_y[path_size-2];
+              	ref_yaw = atan2(ref_y-ref_y_prev,ref_x-ref_x_prev);
+
+				ptsx.push_back(ref_x_prev);
+				ptsx.push_back(ref_x);
+
+				ptsy.push_back(ref_y_prev);
+				ptsy.push_back(ref_y);
+			}
+
+			// In Frenet, add 30m spaced points ahead of the starting refereence
+			vector<double> next_wp0 = getXY(car_s+30, 2+4*lane, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+			vector<double> next_wp1 = getXY(car_s+60, 2+4*lane, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+			vector<double> next_wp2 = getXY(car_s+90, 2+4*lane, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+
+			ptsx.push_back(next_wp0[0]);
+			ptsx.push_back(next_wp1[0]);
+			ptsx.push_back(next_wp2[0]);
+
+			ptsy.push_back(next_wp0[1]);
+			ptsy.push_back(next_wp1[1]);
+			ptsy.push_back(next_wp2[1]);
+
+			// Now, we have 5 points in ptsx, ptsy vectors
+
+			// Transform from global to local coordinates system
+			// Last point of the previous path is shifted to origin
+			// and angles are at zero degrees
+          	for (int i=0; i < ptsx.size(); i++) {
+            	double relativeX = ptsx[i] - ref_x;
+           		double relativeY = ptsy[i] - ref_y;
+
+            	// Counter-clockwise angles in the vehicle model are positive
+            	// However, counter-clockwise angles on the simulator steering command scale are negative
+            	ptsx[i] = relativeX*cos(0-ref_yaw) - relativeY*sin(0-ref_yaw);
+            	ptsy[i] = relativeX*sin(0-ref_yaw) + relativeY*cos(0-ref_yaw);
+          	}
+
+			tk::spline s;
+			sort_coords(ptsx, ptsy);
+			s.set_points(ptsx, ptsy);
+
+			// Start with all of the previous path points from last time
+			for(int i = 0; i < path_size; i++) {
+            	next_x_vals.push_back(previous_path_x[i]);
+            	next_y_vals.push_back(previous_path_y[i]);
+          	}
+
+			// Calculate how to break up spline points so that we travel at desired reference velocity
+			double target_x = 30.;
+			double target_y = s(target_x);
+			double target_dist = sqrt((target_x)*(target_x) + (target_y)*(target_y));
+
+			double x_add_on = 0;
+
+			bool CHG_LEFT = false;
+			bool CHG_RIGHT = false;
+
+            for(int i = 1; i <= 50-path_size; i++) {
+
+				if (too_close) {
+
+					// Slow down to avoid hitting the car ahead
+					if ((!CHG_LEFT) && (!CHG_RIGHT)) {
+
+						// Retrieve speed of the car ahead
+						double avg_speed = pp.AverageLaneSpeed();
+						if (ref_vel > avg_speed) {
+							ref_vel -= 0.224;
+						}
+
+					} else {
+
+						lane = pp.lane;
+
+					}
+				} 
+				else if (OtherCarLC) {
+				
+					ref_vel -= 0.224;
+				
+				} 
+				else if (ref_vel < 49.5) {
+
+					ref_vel += 0.224;
+
+				}
+
+				if (too_close) {
+
+					// First check for left lane and then then check right
+					CHG_LEFT = pp.PrepareLCL(car_speed);
+   					//cout << "PrepareLCL" << endl;
+
+					CHG_RIGHT = pp.PrepareLCR(car_speed);
+   					//cout << "PrepareLCR" << endl;
+				
+					// lane = pp.lane;
+
+				} 
+
+				double N = (target_dist/(0.02*(ref_vel/2.24)));
+				double x_point = x_add_on + (target_x)/N;
+				double y_point = s(x_point);
+
+				x_add_on = x_point;
+
+				double x_ref = x_point;
+				double y_ref = y_point;
+
+				// Rotate back to global coordinates
+				x_point = (x_ref * cos(ref_yaw) - y_ref * sin(ref_yaw));
+				y_point = (x_ref * sin(ref_yaw) + y_ref * cos(ref_yaw));
+
+				x_point += ref_x;
+				y_point += ref_y;
+
+            	next_x_vals.push_back(x_point);
+            	next_y_vals.push_back(y_point);
+			}
+
+          	// define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
+			msgJson["next_x"] = next_x_vals;
           	msgJson["next_y"] = next_y_vals;
 
           	auto msg = "42[\"control\","+ msgJson.dump()+"]";
@@ -290,83 +497,6 @@ int main() {
   }
   h.run();
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
